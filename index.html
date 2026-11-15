@@ -59,8 +59,14 @@
 <div id="dead" class="layer hidden"></div>
 <div id="dist" class="layer">🪰 <span id="distVal">–</span></div>
 
-<div id="leftCol" class="col">
+<div id="movePad" class="hidden">
   <button id="recenter" class="ctl" title="Bring the fly in front of you (F)">⟲ Fly</button>
+  <div id="stick" role="application" aria-label="Move">
+    <div id="stickBase"></div>
+    <div id="stickKnob"></div>
+  </div>
+  <button type="button" id="walkBtn" class="ctl">👣 Walk</button>
+  <p id="moveNote" class="move-note hidden">The camera picture stays still. Only the fly and the virtual room move.</p>
 </div>
 <div id="rightCol" class="col">
   <button id="zoomBtn" class="ctl hidden" title="Scope zoom (wheel)">🔭 3x</button>
@@ -83,6 +89,8 @@
     <ul>
       <li>A giant cartoon fly is loose in your house. Follow the buzz and the edge arrows.</li>
       <li>Turn your whole body with the phone to aim. Tap anywhere to fire.</li>
+      <li>Walk with the stick on the bottom left, or take real steps with the phone (toggle 👣 Walk). WASD works on a computer.</li>
+      <li>The live camera picture stays still — only the fly, the arrows, and the virtual room move with you. iPhone Safari can't track your position in space.</li>
       <li><b>ADS</b> raises the blaster to your eye: iron sights, a red dot, or the Long Shot's scope (🔭 zoom, 🫁 hold breath).</li>
       <li>Tap the ammo counter to reload. The fly dodges if you hold your aim on it too long.</li>
       <li>Turn the silent switch off so you can hear the buzz. 🎧 Headphones work best.</li>

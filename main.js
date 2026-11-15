@@ -16,6 +16,11 @@ const isTouch = ('ontouchstart' in window) || navigator.maxTouchPoints > 0;
 const ROUND = 60;
 const HIT_R = 0.2;           // generous hit radius around the fly (m)
 const AV_R = 0.38;           // hit radius around a duel avatar (m)
+const PLAY_LIMIT = 6.2;      // walkable half-extent; virtual room is 14 m
+const WALK_SPEED = 1.55;     // m/s
+const STEP_LEN = 0.7;        // meters advanced per detected step
+const EYE_Y = 0;
+const playerPos = new THREE.Vector3(0, EYE_Y, 0);
 const CAM_FOV_LONG = 69;     // iPhone main (1x) camera FOV across the long side (deg)
 const WHITE = new THREE.Color(1, 1, 1);
 
@@ -151,7 +156,7 @@ function clampBounds(p) {
 }
 function respawnFly(inFront) {
   const f = fly;
-  if (inFront) { const fwd = new V3(0, 0, -1).applyQuaternion(qBase); fwd.y = clamp(fwd.y, -0.2, 0.25); f.pos.copy(fwd.normalize().multiplyScalar(4)); }
+  if (inFront) { const fwd = new V3(0, 0, -1).applyQuaternion(qBase); fwd.y = clamp(fwd.y, -0.2, 0.25); if (fwd.lengthSq() < 1e-6) fwd.set(0, 0, -1); f.pos.copy(playerPos).add(fwd.normalize().multiplyScalar(4)); }
   else f.pos.copy(randomPoint());
   clampBounds(f.pos);
   f.vel.set(0, 0, 0); f.target.copy(randomPoint(f.pos)); f.alive = true; f.deadT = 0; f.aimT = 0; f.escapeT = 0; f.n++;
@@ -185,7 +190,11 @@ function updateFly(dt, t) {
   let aimed = false; const to = tmpV.copy(f.pos).sub(camera.position); const dist = to.length();
   const lockA = Math.atan(0.45 / dist);
   f.aimed = camFwd.angleTo(to) < lockA; aimed = f.aimed;
-  if (mp.on) for (const p of mp.players.values()) if (p.id !== mp.myId && p.connected && p.fwd && p.fwd.angleTo(to) < lockA) aimed = true;
+  if (mp.on) for (const p of mp.players.values()) {
+    if (p.id === mp.myId || !p.connected || !p.fwd) continue;
+    tmpV2.copy(f.pos).sub(p.pos); const d = tmpV2.length(); if (d < 1e-4) continue;
+    if (p.fwd.angleTo(tmpV2) < Math.atan(0.45 / d)) aimed = true;
+  }
   if (aimed && state === 'playing') f.aimT += dt; else f.aimT = Math.max(0, f.aimT - dt * 0.5);
   if (f.escapeT <= 0 && f.aimT > f.react) escapeFly(to);
 
@@ -710,11 +719,7 @@ function haptic(ms) {
 let mode = 'none'; // 'gyro' | 'drag' | 'mouse'
 let devOri = null, oriEvents = 0, screenAngle = 0, yaw = 0, pitch = 0;
 window.addEventListener('deviceorientation', (e) => { if (e.alpha == null) return; devOri = e; oriEvents++; });
-window.addEventListener('devicemotion', (e) => {
-  const a = e.acceleration; if (!a || a.x == null) return;
-  const mag = Math.hypot(a.x, a.y, a.z);
-  vm.walkT = Math.max(vm.walkT, clamp((mag - 0.6) / 2.5, 0, 1));
-});
+window.addEventListener('devicemotion', (e) => { onDeviceMotion(e); });
 function readScreenAngle() {
   const a = (screen.orientation && typeof screen.orientation.angle === 'number') ? screen.orientation.angle : (window.orientation || 0);
   screenAngle = a * DEG;
@@ -782,21 +787,101 @@ async function ensurePerms(useCam) {
   initAudio();
   if (permsDone) return;
   let oriP = Promise.resolve('granted');
+  let motionP = Promise.resolve(isTouch && typeof DeviceMotionEvent !== 'undefined' ? 'granted' : 'denied');
   if (isTouch && typeof DeviceOrientationEvent !== 'undefined' && typeof DeviceOrientationEvent.requestPermission === 'function')
     oriP = DeviceOrientationEvent.requestPermission().catch(() => 'denied');
   if (isTouch && typeof DeviceMotionEvent !== 'undefined' && typeof DeviceMotionEvent.requestPermission === 'function')
-    DeviceMotionEvent.requestPermission().catch(() => {});
+    motionP = DeviceMotionEvent.requestPermission().catch(() => 'denied');
   const camP = (useCam && isTouch) ? startCamera() : Promise.resolve(false);
-  const [ori, camOk] = await Promise.all([oriP, camP]);
+  const [ori, camOk, motion] = await Promise.all([oriP, camP, motionP]);
+  motionPerm = motion;
+  walkMoveOn = motion === 'granted';
   if (isTouch) {
     mode = (ori === 'granted' && await waitOri(1000)) ? 'gyro' : 'drag';
     if (mode === 'drag') toast('Motion sensors unavailable. Drag to look, tap to fire.');
   } else mode = 'mouse';
   room.visible = !camOk;
   permsDone = true; started = true;
-  onResize(); updateCameraOrientation();
+  onResize(); updateCameraOrientation(); syncMoveUi();
 }
 function lockMouse() { if (mode === 'mouse' && canvas.requestPointerLock) { try { const r = canvas.requestPointerLock(); if (r && r.catch) r.catch(() => {}); } catch (e) {} } }
+
+// ---------------- locomotion (joystick, WASD, optional walk-to-move) ----------------
+const joy = { id: null, x: 0, y: 0 };
+const keysMove = Object.create(null);
+const stepDir = new V3(0, 0, -1);
+let stepRemain = 0, stepFilt = 0, stepArmed = true, lastStepAt = 0;
+let walkMoveOn = false, motionPerm = 'unknown';
+const STEP_PEAK = 1.35, STEP_VALLEY = 0.55, STEP_MIN_DT = 0.32;
+
+function clampPlayer(p) {
+  p.x = clamp(p.x, -PLAY_LIMIT, PLAY_LIMIT);
+  p.z = clamp(p.z, -PLAY_LIMIT, PLAY_LIMIT);
+  p.y = EYE_Y;
+  return p;
+}
+function resetPlayerPos(slot) {
+  if (typeof slot === 'number') spawnPos(slot, playerPos); else playerPos.set(0, EYE_Y, 0);
+  joy.x = 0; joy.y = 0; stepRemain = 0; clampPlayer(playerPos);
+}
+function facingXZ(out) {
+  const fx = baseFwd.x, fz = baseFwd.z, len = Math.hypot(fx, fz);
+  return len < 1e-4 ? out.set(0, 0, -1) : out.set(fx / len, 0, fz / len);
+}
+function takeStep() {
+  facingXZ(stepDir);
+  stepRemain = Math.min(stepRemain + STEP_LEN, STEP_LEN * 2.2);
+}
+function onDeviceMotion(e) {
+  const a = e.acceleration; if (!a || a.x == null) return;
+  const mag = Math.hypot(a.x || 0, a.y || 0, a.z || 0);
+  vm.walkT = Math.max(vm.walkT, clamp((mag - 0.6) / 2.5, 0, 1));
+  stepFilt = stepFilt * 0.75 + mag * 0.25;
+  if (!walkMoveOn || !started || state !== 'playing') return;
+  const now = performance.now() / 1000;
+  if (stepArmed && stepFilt >= STEP_PEAK && now - lastStepAt > STEP_MIN_DT) {
+    takeStep(); lastStepAt = now; stepArmed = false;
+  } else if (!stepArmed && stepFilt < STEP_VALLEY) stepArmed = true;
+}
+function updatePlayerMove(dt) {
+  if (!(started && state === 'playing')) { clampPlayer(playerPos); return; }
+  facingXZ(tmpV);
+  const fX = tmpV.x, fZ = tmpV.z, rX = -fZ, rZ = fX; // right = forward × up
+  let ax = 0, az = 0;
+  ax += joy.x; az += joy.y;
+  let kx = 0, kz = 0;
+  if (keysMove.KeyW || keysMove.ArrowUp) kz += 1;
+  if (keysMove.KeyS || keysMove.ArrowDown) kz -= 1;
+  if (keysMove.KeyA || keysMove.ArrowLeft) kx -= 1;
+  if (keysMove.KeyD || keysMove.ArrowRight) kx += 1;
+  if (kx || kz) { const n = Math.hypot(kx, kz); ax += kx / n; az += kz / n; }
+  let mag = Math.hypot(ax, az);
+  if (mag > 1) { ax /= mag; az /= mag; mag = 1; }
+  if (mag > 0.18) {
+    const scale = ((mag - 0.18) / 0.82) * WALK_SPEED * dt;
+    playerPos.x += (rX * ax + fX * az) / mag * scale;
+    playerPos.z += (rZ * ax + fZ * az) / mag * scale;
+  }
+  if (stepRemain > 0) {
+    const dist = Math.min(stepRemain, 2.4 * dt);
+    playerPos.addScaledVector(stepDir, dist);
+    stepRemain -= dist;
+  }
+  clampPlayer(playerPos);
+  const spd = (mag > 0.18 ? WALK_SPEED * ((mag - 0.18) / 0.82) : 0) + (stepRemain > 0 ? 2.4 : 0);
+  if (spd > 0.15) vm.walkT = Math.max(vm.walkT, clamp(spd / WALK_SPEED, 0, 1));
+}
+function syncMoveUi() {
+  const pad = $('movePad'); if (!pad) return;
+  pad.classList.toggle('hidden', !started || state === 'menu');
+  const btn = $('walkBtn');
+  if (btn) {
+    btn.classList.toggle('on', walkMoveOn);
+    btn.classList.toggle('off', !walkMoveOn);
+    btn.textContent = walkMoveOn ? '👣 Walk on' : '👣 Walk off';
+  }
+  const note = $('moveNote'); if (note) note.classList.toggle('hidden', !camOn);
+}
 
 // ---------------- game state ----------------
 let state = 'menu', elapsed = 0, timeLeft = ROUND, score = 0, lastTick = 0, lastShot = 0, triggerHeld = false, started = false;
@@ -809,13 +894,13 @@ function canFire(forAds) {
   if (forAds) return started && state !== 'over';
   return state === 'playing' && !(gameMode() === 'duel' && !mp.meAlive);
 }
-if (!isTouch) $('deskNote').textContent = 'Desktop: click to lock the mouse, move to look, click to fire. Hold right-click (or Z) to aim down sights, wheel = scope zoom, Shift = hold breath, R = reload, 1–4 = blasters, F = call the fly.';
+if (!isTouch) $('deskNote').textContent = 'Desktop: click to lock the mouse, move to look, click to fire. WASD or arrow keys walk. Hold right-click (or Z) to aim down sights, wheel = scope zoom, Shift = hold breath, R = reload, 1–4 = blasters, F = call the fly.';
 
 function resetLoadout() { for (const k in WEAPONS) WEAPONS[k].ammo = WEAPONS[k].mag; vm.reload = null; updateAmmo(); }
 function startSoloRound() {
   state = 'playing'; elapsed = 0; timeLeft = ROUND; score = 0; lastTick = 0;
   Object.assign(stats, { shots: 0, hits: 0, kills: 0, dodges: 0 });
-  resetLoadout(); respawnFly(true); updateHud(); lockMouse();
+  resetPlayerPos(); resetLoadout(); respawnFly(true); updateHud(); lockMouse(); syncMoveUi();
 }
 function endSoloRound() {
   state = 'over'; triggerHeld = false; vm.adsWant = false; sfx.end();
@@ -827,6 +912,7 @@ function endSoloRound() {
   $('best').textContent = best; $('againBtn').classList.remove('hidden'); $('overLobby').classList.add('hidden'); $('overWait').classList.add('hidden');
   if (document.pointerLockElement) document.exitPointerLock();
   setTimeout(() => $('over').classList.remove('hidden'), 400);
+  syncMoveUi();
 }
 function updateHud() {
   if (mp.on) { const me = mp.players.get(mp.myId); score = me ? me.score : 0; }
@@ -866,7 +952,7 @@ function fire(w) {
   const mode = gameMode();
   if (mode === 'duel') {
     for (const d of dirs.slice(0, 4)) spawnDart(from, camera.position.clone().addScaledVector(d, 14));
-    const msg = { t: 'shot', ht: hostNow(), w: w.id, a: ads ? 1 : 0, d: dirs.map((d) => [r4(d.x), r4(d.y), r4(d.z)]) };
+    const msg = { t: 'shot', ht: hostNow(), w: w.id, a: ads ? 1 : 0, d: dirs.map((d) => [r4(d.x), r4(d.y), r4(d.z)]), o: [r4(playerPos.x), r4(playerPos.y), r4(playerPos.z)] };
     if (mp.host) hostResolveShot(mp.myId, msg); else mp.net.send(msg);
     return;
   }
@@ -922,13 +1008,13 @@ const mp = { on: false, host: false, mode: 'race', code: '', net: null, players:
   roundEnd: 0, state: 'lobby', meAlive: true, hp: 100, txPose: 0, txFly: 0, txPlayers: 0, txPing: 0, reconnecting: false, reconnectUntil: 0, lost: false };
 function hostNow() { return performance.now() / 1000 + (mp.on && !mp.host ? mp.offset : 0); }
 const hashStr = (s) => { let h = 2166136261; for (const ch of s) { h ^= ch.charCodeAt(0); h = Math.imul(h, 16777619); } return h >>> 0; };
-function arenaPos(slot, t, out = new V3()) {
+function spawnPos(slot, out = new V3()) {
   const base = SLOT_ORDER[slot % 6] * Math.PI / 3;
-  const phi = base + 0.5 * Math.sin(0.33 * t + slot * 1.7);
-  return out.set(3 * Math.cos(phi), 0.3 * Math.sin(0.45 * t + slot * 2.1), 3 * Math.sin(phi));
+  return out.set(3 * Math.cos(base), EYE_Y, 3 * Math.sin(base));
 }
+function arenaPos(slot, t, out = new V3()) { return spawnPos(slot, out); }
 const playerList = () => [...mp.players.values()].map((p) => ({ id: p.id, name: p.name, score: p.score, kills: p.kills, deaths: p.deaths, hp: p.hp, alive: p.alive, slot: p.slot, connected: p.connected, ping: p.ping }));
-function newPlayer(id, name, slot) { return { id, name, score: 0, kills: 0, deaths: 0, hp: 100, alive: true, slot, connected: true, ping: 0, peer: null, q: new Q(), fwd: new V3(0, 0, -1), ads: 0, w: 'pistol', respawnAt: 0 }; }
+function newPlayer(id, name, slot) { const p = { id, name, score: 0, kills: 0, deaths: 0, hp: 100, alive: true, slot, connected: true, ping: 0, peer: null, q: new Q(), fwd: new V3(0, 0, -1), pos: new V3(), ads: 0, w: 'pistol', respawnAt: 0 }; spawnPos(slot, p.pos); return p; }
 function freeSlot() { const used = new Set([...mp.players.values()].map((p) => p.slot)); for (let i = 0; i < 6; i++) if (!used.has(i)) return i; return mp.players.size % 6; }
 function emit(msg) { mp.net.broadcast(msg); onHostMsg(msg); }   // host: send to everyone and apply locally
 function broadcastPlayers() { if (!mp.host) return; mp.txPlayers = 0; const msg = { t: 'players', list: playerList(), mode: mp.mode, st: mp.state }; mp.net.broadcast(msg); renderPlayersUi(); }
@@ -974,7 +1060,7 @@ function onClientMsg(d, peer) {
       break;
     }
     case 'ping': mp.net.sendTo(peer, { t: 'pong', c: d.c, h: hostNow() }); break;
-    case 'pose': if (p) { p.q.set(d.q[0], d.q[1], d.q[2], d.q[3]); p.fwd.set(0, 0, -1).applyQuaternion(p.q); p.ads = d.a; p.w = WIDX[d.w] || 'pistol'; p.ping = d.pg | 0; } break;
+    case 'pose': if (p) { p.q.set(d.q[0], d.q[1], d.q[2], d.q[3]); p.fwd.set(0, 0, -1).applyQuaternion(p.q); p.ads = d.a; p.w = WIDX[d.w] || 'pistol'; p.ping = d.pg | 0; if (Array.isArray(d.p) && d.p.length >= 3) p.pos.set(d.p[0], d.p[1], d.p[2]); } break;
     case 'claim': if (p) hostClaim(p.id, d.n, d.pts | 0, Array.isArray(d.tags) ? d.tags.slice(0, 2) : []); break;
     case 'startle': if (d.n === fly.n && fly.alive && fly.escapeT <= 0) escapeFly(fly.pos.clone().sub(camera.position)); break;
     case 'shot': if (p) hostResolveShot(p.id, d); break;
@@ -992,12 +1078,13 @@ function hostClaim(id, n, pts, tags) {
 function hostResolveShot(id, s) {
   const sh = mp.players.get(id); if (!sh || !sh.alive || mp.state !== 'playing' || !Array.isArray(s.d)) return;
   const W = WEAPONS[s.w] || WEAPONS.pistol; const ht = clamp(+s.ht || hostNow(), hostNow() - 0.5, hostNow());
-  const o = arenaPos(sh.slot, ht), dmgBy = new Map(), d = new V3(), c = new V3();
+  const o = new V3(), dmgBy = new Map(), d = new V3(), c = new V3();
+  if (Array.isArray(s.o) && s.o.length >= 3) o.set(s.o[0], s.o[1], s.o[2]); else o.copy(sh.pos);
   for (const dv of s.d.slice(0, 12)) {
     d.set(dv[0], dv[1], dv[2]).normalize(); let bestT = Infinity, target = null;
     for (const p of mp.players.values()) {
       if (p.id === id || !p.alive || !p.connected) continue;
-      arenaPos(p.slot, ht, c).sub(o); const tt = c.dot(d); if (tt <= 0) continue;
+      c.copy(p.pos).sub(o); const tt = c.dot(d); if (tt <= 0) continue;
       if (c.lengthSq() - tt * tt < AV_R * AV_R && tt < bestT) { bestT = tt; target = p; }
     }
     if (target) dmgBy.set(target, (dmgBy.get(target) || 0) + (W.scope && s.a ? 100 : W.dmg));
@@ -1013,7 +1100,7 @@ function hostResolveShot(id, s) {
 }
 function hostStartRound() {
   if (!mp.host) return;
-  for (const p of mp.players.values()) Object.assign(p, { score: 0, kills: 0, deaths: 0, hp: 100, alive: true });
+  for (const p of mp.players.values()) { Object.assign(p, { score: 0, kills: 0, deaths: 0, hp: 100, alive: true }); spawnPos(p.slot, p.pos); }
   mp.roundEnd = hostNow() + ROUND; mp.state = 'playing';
   if (mp.mode === 'race') respawnFly(true);
   emit({ t: 'start', mode: mp.mode, end: mp.roundEnd });
@@ -1029,8 +1116,8 @@ function hostTick(dt) {
   if (mp.mode === 'race' && mp.txFly >= 1 / 15) sendFly();
   if (mp.txPose >= 0.08) {
     mp.txPose = 0; const me = mp.players.get(mp.myId);
-    if (me) { me.q.copy(camera.quaternion); me.ads = vm.ads > 0.5 ? 1 : 0; me.w = weaponId; }
-    mp.net.broadcast({ t: 'poses', l: [...mp.players.values()].map((p) => [p.id, r4(p.q.x), r4(p.q.y), r4(p.q.z), r4(p.q.w), p.ads ? 1 : 0, WIDX.indexOf(p.w)]) });
+    if (me) { me.q.copy(camera.quaternion); me.pos.copy(playerPos); me.ads = vm.ads > 0.5 ? 1 : 0; me.w = weaponId; }
+    mp.net.broadcast({ t: 'poses', l: [...mp.players.values()].map((p) => [p.id, r4(p.q.x), r4(p.q.y), r4(p.q.z), r4(p.q.w), p.ads ? 1 : 0, WIDX.indexOf(p.w), r4(p.pos.x), r4(p.pos.y), r4(p.pos.z)]) });
   }
   if (mp.txPlayers >= 1) broadcastPlayers();
 }
@@ -1065,7 +1152,7 @@ function clientTick(dt) {
   if (!mp.net.connected) return;
   mp.txPing += dt; mp.txPose += dt;
   if (mp.txPing >= 2) { mp.txPing = 0; mp.net.send({ t: 'ping', c: performance.now() / 1000 }); }
-  if (mp.txPose >= 0.08) { mp.txPose = 0; const q = camera.quaternion; mp.net.send({ t: 'pose', q: [r4(q.x), r4(q.y), r4(q.z), r4(q.w)], a: vm.ads > 0.5 ? 1 : 0, w: WIDX.indexOf(weaponId), pg: Math.round(mp.ping) }); }
+  if (mp.txPose >= 0.08) { mp.txPose = 0; const q = camera.quaternion; mp.net.send({ t: 'pose', q: [r4(q.x), r4(q.y), r4(q.z), r4(q.w)], p: [r4(playerPos.x), r4(playerPos.y), r4(playerPos.z)], a: vm.ads > 0.5 ? 1 : 0, w: WIDX.indexOf(weaponId), pg: Math.round(mp.ping) }); }
 }
 function applyList(list) {
   const seen = new Set();
@@ -1096,7 +1183,7 @@ function onHostMsg(d) {
       break;
     }
     case 'players': if (!mp.host) { mp.mode = d.mode; if (d.st) mp.state = d.st; applyList(d.list); } break;
-    case 'poses': if (mp.host) break; for (const r of d.l) { const p = mp.players.get(r[0]); if (!p || p.id === mp.myId) continue; p.q.set(r[1], r[2], r[3], r[4]); p.fwd.set(0, 0, -1).applyQuaternion(p.q); p.ads = r[5]; p.w = WIDX[r[6]] || 'pistol'; } break;
+    case 'poses': if (mp.host) break; for (const r of d.l) { const p = mp.players.get(r[0]); if (!p || p.id === mp.myId) continue; p.q.set(r[1], r[2], r[3], r[4]); p.fwd.set(0, 0, -1).applyQuaternion(p.q); p.ads = r[5]; p.w = WIDX[r[6]] || 'pistol'; if (r.length >= 10) p.pos.set(r[7], r[8], r[9]); } break;
     case 'mode': mp.mode = d.mode; renderPlayersUi(); break;
     case 'fly':
       if (mp.host) break;
@@ -1118,10 +1205,10 @@ function onHostMsg(d) {
       if (d.by === mp.myId) { stats.hits++; hitMarker(!!d.k); sfx.hit(); if (d.k) stats.kills++; const av = avatars.get(d.to); if (av) { const s = toScreen(av.g.position); if (s.on) popup(d.k ? 'ELIMINATED +100' : `-${d.dmg}`, s.x, s.y - 40, d.k ? '' : 'small'); } }
       break;
     }
-    case 'respawn': { const p = mp.players.get(d.id); if (p) { p.alive = true; p.hp = 100; } if (d.id === mp.myId) { mp.meAlive = true; mp.hp = 100; $('dead').classList.add('hidden'); resetLoadout(); } break; }
+    case 'respawn': { const p = mp.players.get(d.id); if (p) { p.alive = true; p.hp = 100; spawnPos(p.slot, p.pos); } if (d.id === mp.myId) { mp.meAlive = true; mp.hp = 100; resetPlayerPos(p ? p.slot : 0); $('dead').classList.add('hidden'); resetLoadout(); } break; }
     case 'fx': {
       const p = mp.players.get(d.by); if (!p || d.by === mp.myId) break;
-      const from = arenaPos(p.slot, hostNow()).add(new V3(0, -0.05, 0)), col = new THREE.Color(SLOT_COLORS[p.slot % 6]).getHex();
+      const from = p.pos.clone().add(new V3(0, -0.05, 0)), col = new THREE.Color(SLOT_COLORS[p.slot % 6]).getHex();
       for (const v of d.d) spawnDart(from, from.clone().addScaledVector(new V3(v[0], v[1], v[2]), 12), col);
       tone({ type: 'square', f0: 700, f1: 220, dur: 0.1, vol: 0.05 });
       break;
@@ -1132,9 +1219,10 @@ function beginMpRound(d) {
   if (d) { mp.mode = d.mode; mp.roundEnd = d.end; }
   mp.state = 'playing'; state = 'playing'; lastTick = 0; mp.meAlive = true; mp.hp = 100;
   Object.assign(stats, { shots: 0, hits: 0, kills: 0, dodges: 0 });
+  const me = mp.players.get(mp.myId); resetPlayerPos(me ? me.slot : 0);
   resetLoadout(); hideOverlays(); $('dead').classList.add('hidden');
   fly.obj.visible = mp.mode === 'race' && fly.alive;
-  lockMouse(); renderPlayersUi();
+  lockMouse(); renderPlayersUi(); syncMoveUi();
   toast(mp.mode === 'race' ? '🪰 FLY RACE! First to hit the fly scores.' : '⚔️ DUEL! Find your rivals and tag them.');
 }
 function endMpRound(d) {
@@ -1148,14 +1236,16 @@ function endMpRound(d) {
   $('againBtn').classList.toggle('hidden', !mp.host); $('overLobby').classList.toggle('hidden', !mp.host); $('overWait').classList.toggle('hidden', mp.host);
   if (document.pointerLockElement) document.exitPointerLock();
   setTimeout(() => $('over').classList.remove('hidden'), 400);
+  syncMoveUi();
 }
 function leaveRoom() {
   if (mp.net) mp.net.close();
   mp.on = false; mp.players.clear(); state = 'menu'; frand = Math.random;
   for (const av of avatars.values()) scene.remove(av.g); avatars.clear();
   fly.obj.visible = true; if (!fly.alive) respawnFly(false);
+  resetPlayerPos();
   history.replaceState(null, '', location.pathname + (Net === LocalNet ? '?net=local' : ''));
-  hideOverlays(); $('dead').classList.add('hidden'); $('start').classList.remove('hidden'); setNet(''); renderPlayersUi();
+  hideOverlays(); $('dead').classList.add('hidden'); $('start').classList.remove('hidden'); setNet(''); renderPlayersUi(); syncMoveUi();
 }
 const esc = (s) => String(s).replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
 
@@ -1196,7 +1286,9 @@ function updateAvatars(dt, t) {
     let av = avatars.get(p.id); if (!av) { av = makeAvatar(p); avatars.set(p.id, av); }
     av.g.visible = duel && p.alive;
     if (!av.g.visible) continue;
-    arenaPos(p.slot, t, av.g.position); av.g.position.y += Math.sin(t * 2 + p.slot) * 0.04;
+    if (av.g.position.distanceToSquared(p.pos) > 4) av.g.position.copy(p.pos);
+    else av.g.position.lerp(p.pos, 1 - Math.exp(-14 * dt));
+    av.g.position.y += Math.sin(t * 2 + p.slot) * 0.04;
     av.head.quaternion.slerp(p.q, 1 - Math.exp(-12 * dt));
     av.glint.visible = p.w === 'sniper' && !!p.ads; if (av.glint.visible) av.glint.material.opacity = 0.6 + 0.4 * Math.sin(t * 9);
     drawLabel(av, p);
@@ -1217,7 +1309,7 @@ function enterLobby() {
   const link = `${location.origin}${location.pathname}?room=${mp.code}${Net === LocalNet ? '&net=local' : ''}`;
   $('lobbyCode').textContent = mp.code; $('lobbyLink').textContent = link; $('lobbyLink').href = link;
   if (document.pointerLockElement) document.exitPointerLock();
-  setNet('🟢 ' + mp.code); renderPlayersUi();
+  setNet('🟢 ' + mp.code); renderPlayersUi(); syncMoveUi();
 }
 function renderPlayersUi() {
   const list = [...mp.players.values()].sort((a, b) => b.score - a.score || a.slot - b.slot);
@@ -1253,6 +1345,44 @@ if (roomParam) { $('codeInput').value = roomParam; $('mpBox').classList.add('foc
 
 // ---------------- input ----------------
 const pointers = new Map(); let pinch = null;
+
+function joyFromEvent(e) {
+  const el = $('stick'), kn = $('stickKnob'); if (!el) return;
+  const rect = el.getBoundingClientRect(), R = Math.max(8, rect.width * 0.5 - 8);
+  const cx = rect.left + rect.width / 2, cy = rect.top + rect.height / 2;
+  let dx = e.clientX - cx, dy = e.clientY - cy;
+  const d = Math.hypot(dx, dy); if (d > R) { dx *= R / d; dy *= R / d; }
+  if (kn) kn.style.transform = `translate(${dx}px,${dy}px)`;
+  const nx = dx / R, ny = -dy / R, m = Math.hypot(nx, ny);
+  if (m < 0.18) { joy.x = 0; joy.y = 0; }
+  else { const k = (m - 0.18) / 0.82 / m; joy.x = nx * k; joy.y = ny * k; }
+}
+function joyEnd() {
+  joy.id = null; joy.x = 0; joy.y = 0;
+  const kn = $('stickKnob'); if (kn) kn.style.transform = '';
+}
+const stickEl = $('stick');
+stickEl.addEventListener('pointerdown', (e) => {
+  e.preventDefault(); e.stopPropagation();
+  if (!started) return;
+  if (audio.ctx && audio.ctx.state !== 'running') audio.ctx.resume();
+  joy.id = e.pointerId; try { stickEl.setPointerCapture(e.pointerId); } catch (err) {}
+  joyFromEvent(e);
+});
+stickEl.addEventListener('pointermove', (e) => { if (e.pointerId !== joy.id) return; e.preventDefault(); e.stopPropagation(); joyFromEvent(e); });
+const stickUp = (e) => { if (e.pointerId !== joy.id) return; e.stopPropagation(); joyEnd(); };
+stickEl.addEventListener('pointerup', stickUp);
+stickEl.addEventListener('pointercancel', stickUp);
+$('walkBtn').addEventListener('click', async (e) => {
+  e.stopPropagation();
+  if (!walkMoveOn && isTouch && typeof DeviceMotionEvent !== 'undefined' && typeof DeviceMotionEvent.requestPermission === 'function' && motionPerm !== 'granted') {
+    try { motionPerm = await DeviceMotionEvent.requestPermission(); } catch (err) { motionPerm = 'denied'; }
+    walkMoveOn = motionPerm === 'granted';
+    if (!walkMoveOn) toast('Motion permission is needed for walk-to-move. You can still use the stick.');
+  } else walkMoveOn = !walkMoveOn;
+  syncMoveUi();
+});
+
 canvas.addEventListener('contextmenu', (e) => e.preventDefault());
 canvas.addEventListener('mousedown', (e) => {
   if (mode !== 'mouse' || !started) return;
@@ -1307,8 +1437,10 @@ window.addEventListener('keydown', (e) => {
   else if (e.code === 'KeyF') $('recenter').click();
   else if (e.code === 'ShiftLeft' || e.code === 'ShiftRight') holdBreath();
   else if (e.code === 'Space' && state === 'playing') { triggerHeld = true; tryFire(); e.preventDefault(); }
+  if (e.code in { KeyW:1, KeyA:1, KeyS:1, KeyD:1, ArrowUp:1, ArrowDown:1, ArrowLeft:1, ArrowRight:1 }) { keysMove[e.code] = 1; e.preventDefault(); }
 });
-window.addEventListener('keyup', (e) => { if (e.code === 'Space') triggerHeld = false; });
+window.addEventListener('keyup', (e) => { if (e.code === 'Space') triggerHeld = false; if (e.code in keysMove) keysMove[e.code] = 0; });
+window.addEventListener('blur', () => { for (const k of Object.keys(keysMove)) keysMove[k] = 0; });
 document.addEventListener('gesturestart', (e) => e.preventDefault());
 
 // ---------------- HUD helpers ----------------
@@ -1368,8 +1500,9 @@ function frame() {
   feedTimer += dt; if (feedTimer > 0.25) { feedTimer = 0; sampleFeed(); }
   applyLights(dt);
   const duel = gameMode() === 'duel';
-  if (duel) { const me = mp.players.get(mp.myId); if (me) arenaPos(me.slot, hostNow(), camera.position); } else camera.position.set(0, 0, 0);
   updateCameraOrientation();
+  updatePlayerMove(dt);
+  camera.position.copy(playerPos);
   if (state === 'playing') {
     if (mp.on) timeLeft = Math.max(0, mp.roundEnd - hostNow());
     else { elapsed += dt; timeLeft = Math.max(0, ROUND - elapsed); }
@@ -1392,4 +1525,20 @@ function frame() {
 onResize(); zoomUi(); updateAmmo();
 frame();
 // small hook for automated testing / debugging in the console
-window.flyHunt = { fly, camera, mp, vm, WEAPONS, arenaPos, hostNow, avatars, get state() { return state; }, get score() { return score; }, get weapon() { return weaponId; }, fireNow: () => { lastShot = 0; tryFire(); }, lookAt: (p) => { const d = p.clone().sub(camera.position).normalize(); yaw = Math.atan2(-d.x, -d.z); pitch = Math.asin(d.y); }, setAds, startReload, selectWeapon };
+window.flyHunt = {
+  fly, camera, mp, vm, WEAPONS, arenaPos, spawnPos, hostNow, avatars, playerPos,
+  PLAY_LIMIT, WALK_SPEED, STEP_LEN,
+  get state() { return state; }, get score() { return score; }, get weapon() { return weaponId; },
+  get walkMove() { return walkMoveOn; },
+  setWalkMove(on) { walkMoveOn = !!on; syncMoveUi(); },
+  setJoy(x, y) { joy.x = clamp(+x || 0, -1, 1); joy.y = clamp(+y || 0, -1, 1); },
+  step(n = 1) {
+    if (mode !== 'gyro') { eul.set(pitch, yaw, 0, 'YXZ'); qBase.setFromEuler(eul); baseFwd.set(0, 0, -1).applyQuaternion(qBase); }
+    for (let i = 0; i < (n || 1); i++) takeStep();
+  },
+  clampPlayer, resetPlayerPos,
+  fireNow: () => { lastShot = 0; tryFire(); },
+  lookAt: (p) => { const d = p.clone().sub(playerPos).normalize(); yaw = Math.atan2(-d.x, -d.z); pitch = Math.asin(clamp(d.y, -1, 1)); },
+  setAds, startReload, selectWeapon,
+  async startSolo() { await ensurePerms(false); hideOverlays(); startSoloRound(); },
+};
