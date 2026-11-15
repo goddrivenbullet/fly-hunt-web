@@ -10,17 +10,40 @@
 <link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>🪰</text></svg>">
 <link rel="stylesheet" href="style.css">
 <script type="importmap">
-{ "imports": { "three": "https://cdn.jsdelivr.net/npm/three@0.170.0/build/three.module.js" } }
+{ "imports": {
+  "three": "https://cdn.jsdelivr.net/npm/three@0.170.0/build/three.module.js",
+  "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.170.0/examples/jsm/"
+} }
 </script>
 </head>
 <body>
 <video id="cam" playsinline muted autoplay></video>
 <canvas id="gl"></canvas>
 
-<div id="scope" class="layer hidden"><div class="h"></div><div class="v"></div><span id="zoomLabel">3x</span></div>
+<div id="scope" class="layer">
+  <div class="vig" id="scopeVigShift"></div>
+  <svg class="reticle" viewBox="-100 -100 200 200" aria-hidden="true">
+    <defs><filter id="glow"><feGaussianBlur stdDeviation="1.2" result="b"/><feMerge><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge></filter></defs>
+    <g stroke="#0b0b0b" fill="none">
+      <path d="M-100 0H-60M60 0H100M0 -100V-60M0 60V100" stroke-width="3.2"/>
+      <path d="M-60 0H-4M4 0H60M0 -60V-4M0 4V60" stroke-width="0.7"/>
+      <g fill="#0b0b0b" stroke="none">
+        <circle cx="-15" cy="0" r="1.1"/><circle cx="-30" cy="0" r="1.1"/><circle cx="-45" cy="0" r="1.1"/>
+        <circle cx="15" cy="0" r="1.1"/><circle cx="30" cy="0" r="1.1"/><circle cx="45" cy="0" r="1.1"/>
+        <circle cx="0" cy="-15" r="1.1"/><circle cx="0" cy="-30" r="1.1"/><circle cx="0" cy="-45" r="1.1"/>
+        <circle cx="0" cy="15" r="1.1"/><circle cx="0" cy="30" r="1.1"/><circle cx="0" cy="45" r="1.1"/>
+      </g>
+      <path d="M-5 22H5M-4 37H4M-3 52H3" stroke-width="0.6"/>
+    </g>
+    <circle cx="0" cy="0" r="1.4" fill="#ff1744" filter="url(#glow)"/>
+  </svg>
+  <div class="glare" id="glare"></div>
+  <span id="zoomLabel">3x</span>
+</div>
 <div id="flash" class="layer"></div>
 <div id="bracket" class="layer hidden"></div>
 <div id="crosshair" class="layer"><i></i></div>
+<div id="hitmarker" class="layer"><b></b><b></b><b></b><b></b></div>
 <div id="arrow" class="layer hidden"><div class="tri"></div><span id="arrowDist">0 m</span></div>
 <div id="pops" class="layer"></div>
 <div id="toast" class="layer hidden"></div>
@@ -30,11 +53,20 @@
   <div class="chip timer"><b>TIME</b><span id="time">60</span></div>
   <div class="chip"><b>BEST</b><span id="best">0</span></div>
 </div>
+<div id="net" class="layer hidden"></div>
+<div id="board" class="layer hidden"></div>
+<div id="dmg" class="layer"></div>
+<div id="dead" class="layer hidden"></div>
 <div id="dist" class="layer">🪰 <span id="distVal">–</span></div>
 
-<div id="controls">
-  <button id="recenter" class="ctl" title="Bring the fly in front of you">⟲ Fly</button>
-  <button id="zoomBtn" class="ctl hidden" title="Scope zoom">🔭 Scope</button>
+<div id="leftCol" class="col">
+  <button id="recenter" class="ctl" title="Bring the fly in front of you (F)">⟲ Fly</button>
+</div>
+<div id="rightCol" class="col">
+  <button id="zoomBtn" class="ctl hidden" title="Scope zoom (wheel)">🔭 3x</button>
+  <button id="breathBtn" class="ctl hidden" title="Hold breath (Shift)">🫁 Hold</button>
+  <button id="adsBtn" class="ctl round" title="Aim down sights (hold right-click / Z)">ADS</button>
+  <button id="ammo" class="ctl ammo" title="Reload (R)"><span class="num"><b id="ammoNum">12</b><small>/∞</small></span><span class="bar"><i id="ammoBar"></i></span><em id="ammoHint">RELOAD</em></button>
 </div>
 <div id="weapons">
   <button data-w="pistol" class="wbtn sel"><i style="background:#29b6f6"></i>Zapper</button>
@@ -51,13 +83,38 @@
     <ul>
       <li>A giant cartoon fly is loose in your house. Follow the buzz and the edge arrows.</li>
       <li>Turn your whole body with the phone to aim. Tap anywhere to fire.</li>
-      <li>It dodges if you hold your aim on it too long, so be quick.</li>
-      <li>Long Shot has a scope: pinch or tap 🔭 to zoom.</li>
+      <li><b>ADS</b> raises the blaster to your eye: iron sights, a red dot, or the Long Shot's scope (🔭 zoom, 🫁 hold breath).</li>
+      <li>Tap the ammo counter to reload. The fly dodges if you hold your aim on it too long.</li>
       <li>Turn the silent switch off so you can hear the buzz. 🎧 Headphones work best.</li>
     </ul>
-    <button id="startBtn" class="big">START · 60s ROUND</button>
-    <button id="nocamBtn" class="link">Play without camera (virtual room)</button>
+    <input id="nameInput" class="field" maxlength="14" placeholder="Your name" autocomplete="nickname">
+    <label class="chk"><input type="checkbox" id="useCam" checked> Use camera (AR)</label>
+    <button id="startBtn" class="big">SOLO · 60s ROUND</button>
+    <button id="nocamBtn" class="link">Solo without camera (virtual room)</button>
+    <div id="mpBox" class="mpbox">
+      <div class="mph">ONLINE MULTIPLAYER</div>
+      <div class="row2"><button id="createRace" class="mid">🪰 Create Fly Race</button><button id="createDuel" class="mid">⚔️ Create Duel</button></div>
+      <div class="row2"><input id="codeInput" class="field code" maxlength="6" placeholder="CODE" autocapitalize="characters" autocomplete="off"><button id="joinBtn" class="mid">Join</button></div>
+      <p class="tiny" id="joinHint">Create a room and share the code or link. Friends can join from anywhere.</p>
+    </div>
     <p class="tiny" id="deskNote"></p>
+  </div>
+</div>
+
+<div id="lobby" class="overlay hidden">
+  <div class="card">
+    <div class="sub">ROOM CODE</div>
+    <div class="roomcode" id="lobbyCode">-----</div>
+    <a id="lobbyLink" class="tiny linkline" target="_blank" rel="noopener"></a>
+    <div class="row2"><button id="copyBtn" class="mid">📋 Copy link</button><button id="shareBtn" class="mid">📤 Share</button></div>
+    <div class="sub" style="margin-top:10px">MODE: <b id="lobbyModeName">Fly Race</b></div>
+    <div id="lobbyPlayers" class="plist"></div>
+    <div id="lobbyHost">
+      <div class="row2"><button id="modeRace" class="mid">🪰 Fly Race</button><button id="modeDuel" class="mid">⚔️ Duel</button></div>
+      <button id="lobbyStartBtn" class="big">START ROUND</button>
+    </div>
+    <p id="lobbyWait" class="sub">Waiting for the host to start…</p>
+    <button id="leaveBtn" class="link">Leave room</button>
   </div>
 </div>
 
@@ -67,6 +124,9 @@
     <div class="big-score" id="finalScore">0</div>
     <div class="stats" id="finalStats"></div>
     <button id="againBtn" class="big">PLAY AGAIN</button>
+    <button id="overLobby" class="mid hidden" style="margin-top:8px;width:100%">Back to lobby</button>
+    <p id="overWait" class="sub hidden">Waiting for the host…</p>
+    <button id="overLeave" class="link hidden">Leave room</button>
   </div>
 </div>
 
